@@ -1,0 +1,1536 @@
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'dart:async';
+
+void main() {
+  runApp(MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Parkinson\'s Tremor Monitor',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        visualDensity: VisualDensity.adaptivePlatformDensity,
+        fontFamily: 'Roboto',
+        cardTheme: CardThemeData(
+          elevation: 8,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        ),
+      ),
+      home: TremorMonitorScreen(),
+      debugShowCheckedModeBanner: false,
+    );
+  }
+}
+
+class TremorMonitorScreen extends StatefulWidget {
+  const TremorMonitorScreen({super.key});
+
+  @override
+  _TremorMonitorScreenState createState() => _TremorMonitorScreenState();
+}
+
+class _TremorMonitorScreenState extends State<TremorMonitorScreen> with TickerProviderStateMixin {
+  // Firebase configuration
+  final String firebaseHost = "https://parkingson-40ec2-default-rtdb.asia-southeast1.firebasedatabase.app/";
+  final String deviceId = "ESP32_723b015c";
+  
+  // Timers
+  Timer? alertCheckTimer;
+  Timer? regularDataTimer;
+  Timer? alertExpiryTimer;
+  
+  // Animation controllers
+  late AnimationController _pulseController;
+  late AnimationController _rotationController;
+  late Animation<double> _pulseAnimation;
+  late Animation<double> _rotationAnimation;
+  
+  // Connection state
+  bool isFirebaseConnected = false;
+  bool hasInitialized = false;
+  String connectionStatus = "Initializing...";
+  
+  // Data variables
+  bool isHighTremor = false;
+  DateTime? lastHighTremorTime;
+  DateTime? lastDataUpdateTime;
+  
+  // Regular tremor data (always updated from regular data stream)
+  double regularDominantFrequency = 0.0;
+  double regularTremorAmplitude = 0.0;
+  double regularRhythmicity = 0.0;
+  double regularHarmonicRatio = 0.0;
+  bool regularIsRestTremor = false;
+  bool regularIsPosturalTremor = false;
+  String regularTremorType = "NONE";
+  String regularLastUpdateTime = "";
+  
+  // Alert tremor data (from high tremor alerts)
+  double alertDominantFrequency = 0.0;
+  double alertTremorAmplitude = 0.0;
+  double alertRhythmicity = 0.0;
+  double alertHarmonicRatio = 0.0;
+  bool alertIsRestTremor = false;
+  bool alertIsPosturalTremor = false;
+  String alertTremorType = "NONE";
+  
+  // Alert data
+  String alertTimestamp = "";
+  String currentAlertKey = "";
+  String lastProcessedAlertKey = "";
+  bool hasNewAlert = false;
+  int currentAlertUnixTime = 0;
+  
+  // Alert history for better tracking
+  Map<String, dynamic> alertHistory = {};
+  
+  // Status
+  int alertCheckCount = 0;
+  int dataUpdateCount = 0;
+  String alertTimeRemaining = "";
+  
+  @override
+  void initState() {
+    super.initState();
+    
+    // Initialize animation controllers
+    _pulseController = AnimationController(
+      duration: Duration(milliseconds: 1000),
+      vsync: this,
+    );
+    _rotationController = AnimationController(
+      duration: Duration(seconds: 2),
+      vsync: this,
+    );
+    
+    _pulseAnimation = Tween<double>(begin: 0.8, end: 1.2).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+    _rotationAnimation = Tween<double>(begin: 0, end: 1).animate(
+      CurvedAnimation(parent: _rotationController, curve: Curves.linear),
+    );
+    
+    initializeFirebase();
+  }
+  
+  @override
+  void dispose() {
+    alertCheckTimer?.cancel();
+    regularDataTimer?.cancel();
+    alertExpiryTimer?.cancel();
+    _pulseController.dispose();
+    _rotationController.dispose();
+    super.dispose();
+  }
+  
+  Future<void> initializeFirebase() async {
+    try {
+      // Test Firebase connection with a simple request
+      String testUrl = "$firebaseHost/.json";
+      final response = await http.get(Uri.parse(testUrl)).timeout(Duration(seconds: 10));
+      
+      if (response.statusCode == 200) {
+        setState(() {
+          isFirebaseConnected = true;
+          hasInitialized = true;
+          connectionStatus = "Connected - Monitoring";
+        });
+        
+        // Start monitoring only after successful Firebase connection
+        startMonitoring();
+        print("✅ Firebase initialized successfully");
+      } else {
+        throw Exception("Firebase returned status: ${response.statusCode}");
+      }
+    } catch (e) {
+      setState(() {
+        isFirebaseConnected = false;
+        hasInitialized = true;
+        connectionStatus = "Connection Failed - Unable to reach Firebase";
+      });
+      print("❌ Firebase initialization failed: $e");
+      
+      // Retry connection every 30 seconds
+      Timer(Duration(seconds: 30), () {
+        if (!isFirebaseConnected) {
+          initializeFirebase();
+        }
+      });
+    }
+  }
+  
+  void startMonitoring() {
+    if (!isFirebaseConnected) return;
+    
+    // Check for alerts every 1 second (as requested)
+    alertCheckTimer = Timer.periodic(Duration(seconds: 1), (timer) {
+      if (isFirebaseConnected) {
+        checkForAlerts();
+      }
+    });
+    
+    // Update regular data every 3 seconds
+    regularDataTimer = Timer.periodic(Duration(seconds: 3), (timer) {
+      if (isFirebaseConnected) {
+        fetchRegularData();
+      }
+    });
+    
+    // Timer to update alert time remaining every second
+    alertExpiryTimer = Timer.periodic(Duration(seconds: 1), (timer) {
+      updateAlertTimeRemaining();
+    });
+    
+    // Initial data fetch
+    checkForAlerts();
+    fetchRegularData();
+  }
+  
+  void updateAlertTimeRemaining() {
+    if (isHighTremor && lastHighTremorTime != null) {
+      DateTime now = DateTime.now();
+      int minutesElapsed = now.difference(lastHighTremorTime!).inMinutes;
+      int minutesRemaining = 15 - minutesElapsed;
+      
+      if (minutesRemaining > 0) {
+        int secondsRemaining = 59 - (now.difference(lastHighTremorTime!).inSeconds % 60);
+        setState(() {
+          alertTimeRemaining = "${minutesRemaining}m ${secondsRemaining}s remaining";
+        });
+      } else {
+        // Alert has expired
+        setState(() {
+          isHighTremor = false;
+          hasNewAlert = false;
+          currentAlertKey = "";
+          alertTimeRemaining = "";
+          connectionStatus = "Connected - No Active Alerts";
+        });
+        _pulseController.stop();
+        print("🕐 Alert expired after 15 minutes - clearing status");
+      }
+    }
+  }
+  
+  Future<void> checkForAlerts() async {
+    if (!isFirebaseConnected) return;
+    
+    try {
+      alertCheckCount++;
+      String alertUrl = "$firebaseHost/alerts/$deviceId.json";
+      
+      final response = await http.get(Uri.parse(alertUrl)).timeout(Duration(seconds: 5));
+      
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        
+        if (data != null && data is Map && data.isNotEmpty) {
+          // Find the most recent alert by timestamp
+          String? latestAlertKey;
+          int latestTimestamp = 0;
+          Map<String, dynamic>? latestAlertData;
+          
+          data.forEach((key, value) {
+            if (value is Map && value['alert_timestamp'] != null) {
+              int timestamp = value['alert_timestamp'];
+              if (timestamp > latestTimestamp) {
+                latestTimestamp = timestamp;
+                latestAlertKey = key;
+                latestAlertData = Map<String, dynamic>.from(value);
+              }
+            }
+          });
+          
+          if (latestAlertKey != null && latestAlertData != null) {
+            // Convert Unix timestamp to DateTime (your timestamps appear to be in seconds)
+            DateTime alertTime = DateTime.fromMillisecondsSinceEpoch(latestTimestamp * 1000);
+            DateTime now = DateTime.now();
+            
+            // Debug print
+            print("🔍 Latest alert: $latestAlertKey at $alertTime");
+            print("🔍 Time difference: ${now.difference(alertTime).inMinutes} minutes");
+            
+            // Check if the alert is within the 15-minute window
+            bool isWithin15Minutes = now.difference(alertTime).inMinutes < 15;
+            
+            if (isWithin15Minutes) {
+              // Check if this is a newer alert than what we currently have
+              bool isNewerAlert = latestTimestamp > currentAlertUnixTime;
+              bool isNewAlertKey = currentAlertKey != latestAlertKey;
+              
+              setState(() {
+                // Always update to the latest alert if it's newer or if no current alert
+                if (isNewerAlert || !isHighTremor || isNewAlertKey) {
+                  isHighTremor = true;
+                  currentAlertKey = latestAlertKey!;
+                  currentAlertUnixTime = latestTimestamp;
+                  lastHighTremorTime = alertTime;
+                  alertTimestamp = latestAlertData!['alert_datetime'] ?? alertTime.toString();
+                  
+                  // Mark as new alert if it's a different key or newer timestamp
+                  hasNewAlert = isNewAlertKey || isNewerAlert;
+                  
+                  // Update alert tremor data from the latest alert
+                  _updateAlertTremorData(latestAlertData!);
+                  
+                  // Store in alert history
+                  alertHistory[latestAlertKey!] = {
+                    'data': latestAlertData,
+                    'timestamp': alertTime,
+                    'processed_at': DateTime.now(),
+                  };
+                  
+                  // Update connection status
+                  if (hasNewAlert) {
+                    connectionStatus = "🚨 NEW TREMOR ALERT DETECTED";
+                    _pulseController.repeat(reverse: true);
+                    print("🚨 NEW/UPDATED ALERT: $latestAlertKey at $alertTimestamp (timestamp: $latestTimestamp)");
+                  } else {
+                    connectionStatus = "⚠️ TREMOR ALERT ACTIVE";
+                  }
+                }
+              });
+              
+              return; // Exit early since we found an active alert
+            } else {
+              print("🕐 Alert found but outside 15-minute window: ${now.difference(alertTime).inMinutes} minutes old");
+            }
+          }
+        }
+        
+        // No alerts within 15 minutes found - clear alert status if currently active
+        if (isHighTremor) {
+          setState(() {
+            isHighTremor = false;
+            hasNewAlert = false;
+            currentAlertKey = "";
+            currentAlertUnixTime = 0;
+            alertTimeRemaining = "";
+            connectionStatus = "Connected - No High Tremor Detected";
+          });
+          _pulseController.stop();
+          print("🕐 No recent alerts found - clearing status");
+        } else if (!isHighTremor && connectionStatus != "Connected - No High Tremor Detected") {
+          setState(() {
+            connectionStatus = "Connected - No High Tremor Detected";
+          });
+        }
+        
+      } else {
+        print("⚠️ Alert check HTTP error: ${response.statusCode}");
+      }
+      
+    } catch (e) {
+      print("⚠️ Alert check network error: $e");
+      // Don't change connection status on network errors to avoid flickering
+    }
+  }
+  
+  Future<void> fetchRegularData() async {
+    if (!isFirebaseConnected) return;
+    
+    try {
+      dataUpdateCount++;
+      String dataUrl = "$firebaseHost/tremor_data/$deviceId.json";
+      
+      final response = await http.get(Uri.parse(dataUrl)).timeout(Duration(seconds: 5));
+      
+      if (response.statusCode == 200) {
+        final decoded = json.decode(response.body);
+        
+        if (decoded != null && decoded is Map) {
+          final Map<String, dynamic> data = Map<String, dynamic>.from(decoded);
+          
+          setState(() {
+            lastDataUpdateTime = DateTime.now();
+            
+            // Always update regular data regardless of alert status
+            _updateRegularTremorData(data);
+            
+            // Update connection status only if no active alert
+            if (!isHighTremor) {
+              bool pdDetected = data['pd_detected'] == true;
+              if (pdDetected) {
+                connectionStatus = "🟡 Connected - Tremor Detected (Normal Level)";
+              } else if (connectionStatus == "Connected - Monitoring") {
+                connectionStatus = "Connected - No High Tremor Detected";
+              }
+            }
+          });
+        } else {
+          // No regular data available yet - this is normal
+          if (!isHighTremor && connectionStatus == "Connected - Monitoring") {
+            setState(() {
+              connectionStatus = "Connected - Waiting for data";
+            });
+          }
+        }
+      } else {
+        print("⚠️ Regular data HTTP error: ${response.statusCode}");
+      }
+      
+    } catch (e) {
+      print("⚠️ Regular data network error: $e");
+    }
+  }
+  
+  void _updateRegularTremorData(Map<String, dynamic> data) {
+    // Update regular tremor analysis data
+    regularDominantFrequency = (data['dominant_frequency'] ?? regularDominantFrequency).toDouble();
+    regularTremorAmplitude = (data['tremor_amplitude'] ?? regularTremorAmplitude).toDouble();
+    regularRhythmicity = (data['rhythmicity'] ?? regularRhythmicity).toDouble();
+    regularHarmonicRatio = (data['harmonic_ratio'] ?? regularHarmonicRatio).toDouble();
+    
+    // Update regular tremor type
+    bool newIsRestTremor = data['is_rest_tremor'] ?? false;
+    bool newIsPosturalTremor = data['is_postural_tremor'] ?? false;
+    
+    regularIsRestTremor = newIsRestTremor;
+    regularIsPosturalTremor = newIsPosturalTremor;
+    
+    if (regularIsRestTremor) {
+      regularTremorType = "REST";
+    } else if (regularIsPosturalTremor) {
+      regularTremorType = "POSTURAL";
+    } else {
+      regularTremorType = "NONE";
+    }
+    
+    regularLastUpdateTime = data['timestamp_readable'] ?? DateTime.now().toString();
+    
+    print("📊 Updated regular tremor data - Type: $regularTremorType, Freq: ${regularDominantFrequency.toStringAsFixed(1)}Hz, Amplitude: ${regularTremorAmplitude.toStringAsFixed(3)}");
+  }
+  
+  void _updateAlertTremorData(Map<String, dynamic> data) {
+    // Update alert tremor analysis data
+    alertDominantFrequency = (data['dominant_frequency'] ?? alertDominantFrequency).toDouble();
+    alertTremorAmplitude = (data['tremor_amplitude'] ?? alertTremorAmplitude).toDouble();
+    alertRhythmicity = (data['rhythmicity'] ?? alertRhythmicity).toDouble();
+    alertHarmonicRatio = (data['harmonic_ratio'] ?? alertHarmonicRatio).toDouble();
+    
+    // Update alert tremor type
+    bool newIsRestTremor = data['is_rest_tremor'] ?? false;
+    bool newIsPosturalTremor = data['is_postural_tremor'] ?? false;
+    
+    alertIsRestTremor = newIsRestTremor;
+    alertIsPosturalTremor = newIsPosturalTremor;
+    
+    if (alertIsRestTremor) {
+      alertTremorType = "REST";
+    } else if (alertIsPosturalTremor) {
+      alertTremorType = "POSTURAL";
+    } else {
+      alertTremorType = "NONE";
+    }
+    
+    print("🚨 Updated alert tremor data - Type: $alertTremorType, Freq: ${alertDominantFrequency.toStringAsFixed(1)}Hz, Amplitude: ${alertTremorAmplitude.toStringAsFixed(3)}");
+  }
+  
+  Color getStatusColor() {
+    if (!hasInitialized) return Colors.orange;
+    if (!isFirebaseConnected) return Colors.red;
+    if (isHighTremor && !hasNewAlert) return Colors.green; // Changed: return to normal when acknowledged
+    if (isHighTremor && hasNewAlert) return Colors.red.shade800;
+    return Colors.green;
+  }
+  
+  IconData getStatusIcon() {
+    if (!hasInitialized) return Icons.hourglass_empty;
+    if (!isFirebaseConnected) return Icons.cloud_off;
+    if (isHighTremor) return hasNewAlert ? Icons.new_releases : Icons.warning;
+    return Icons.check_circle;
+  }
+  
+  String getMainStatusText() {
+    if (!hasInitialized) return 'INITIALIZING...';
+    if (!isFirebaseConnected) return 'CONNECTION FAILED';
+    if (isHighTremor) {
+      return hasNewAlert ? 'NEW HIGH TREMOR ALERT!' : 'HIGH TREMOR DETECTED';
+    }
+    return 'NO HIGH TREMOR DETECTED';
+  }
+  
+  @override
+  Widget build(BuildContext context) {
+    if (!isFirebaseConnected) {
+      _rotationController.repeat();
+    } else {
+      _rotationController.stop();
+    }
+    
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(
+          'Parkinson\'s Tremor Monitor',
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            fontSize: 20,
+          ),
+        ),
+        backgroundColor: getStatusColor(),
+        elevation: 0,
+        centerTitle: true,
+        actions: [
+          if (isHighTremor && hasNewAlert)
+            Container(
+              margin: EdgeInsets.only(right: 16),
+              child: AnimatedBuilder(
+                animation: _pulseAnimation,
+                builder: (context, child) {
+                  return Transform.scale(
+                    scale: _pulseAnimation.value,
+                    child: Icon(
+                      Icons.fiber_new,
+                      color: Colors.white,
+                      size: 28,
+                    ),
+                  );
+                },
+              ),
+            ),
+        ],
+      ),
+      body: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              getStatusColor().withOpacity(0.1),
+              Colors.grey.shade50,
+              Colors.white,
+            ],
+            stops: [0.0, 0.3, 1.0],
+          ),
+        ),
+        child: RefreshIndicator(
+          onRefresh: () async {
+            if (isFirebaseConnected) {
+              await Future.wait([
+                checkForAlerts(),
+                fetchRegularData(),
+              ]);
+            } else {
+              await initializeFirebase();
+            }
+          },
+          child: SingleChildScrollView(
+            physics: AlwaysScrollableScrollPhysics(),
+            padding: EdgeInsets.all(16.0),
+            child: Column(
+              children: [
+                // Main Status Card with enhanced alert indication
+                _buildMainStatusCard(),
+                
+                SizedBox(height: 20),
+                
+                // High Tremor Alert Details Card - Only shown when there's an active alert
+                if (isHighTremor)
+                  _buildAlertDetailsCard(),
+                
+                if (isHighTremor)
+                  SizedBox(height: 20),
+                
+                // Regular Tremor Details Card - Always shown when connected
+                if (isFirebaseConnected)
+                  _buildRegularTremorDetailsCard(),
+                
+                SizedBox(height: 20),
+                
+                // System Status Card
+                _buildSystemStatusCard(),
+                
+                SizedBox(height: 20),
+                
+                // Enhanced action buttons
+                _buildActionButtons(),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+  
+  // Widget _buildMainStatusCard() {
+  //   return AnimatedContainer(
+  //     duration: Duration(milliseconds: 500),
+  //     child: Card(
+  //       elevation: isHighTremor && hasNewAlert ? 16 : 12,
+  //       shadowColor: isHighTremor && hasNewAlert ? Colors.red.withOpacity(0.5) : Colors.black26,
+  //       shape: RoundedRectangleBorder(
+  //         borderRadius: BorderRadius.circular(20),
+  //       ),
+  //       child: Container(
+  //         width: double.infinity,
+  //         padding: EdgeInsets.all(32.0),
+  //         decoration: BoxDecoration(
+  //           borderRadius: BorderRadius.circular(20),
+  //           gradient: LinearGradient(
+  //             begin: Alignment.topLeft,
+  //             end: Alignment.bottomRight,
+  //             colors: !isFirebaseConnected 
+  //                 ? [Colors.red.shade50, Colors.red.shade100]
+  //                 : (isHighTremor && hasNewAlert)
+  //                     ? [Colors.red.shade50, Colors.red.shade100, Colors.red.shade50]
+  //                     : [Colors.green.shade50, Colors.green.shade100, Colors.green.shade50],
+  //           ),
+  //           border: isHighTremor && hasNewAlert
+  //               ? Border.all(color: Colors.red.shade800, width: 3)
+  //               : null,
+  //           boxShadow: isHighTremor && hasNewAlert ? [
+  //             BoxShadow(
+  //               color: Colors.red.withOpacity(0.3),
+  //               blurRadius: 15,
+  //               spreadRadius: 2,
+  //             )
+  //           ] : null,
+  //         ),
+  //         child: Column(
+  //           children: [
+  //             // Status Icon with animation
+  //             AnimatedBuilder(
+  //               animation: !isFirebaseConnected ? _rotationAnimation : _pulseAnimation,
+  //               builder: (context, child) {
+  //                 if (!isFirebaseConnected) {
+  //                   return Transform.rotate(
+  //                     angle: _rotationAnimation.value * 2 * 3.14159,
+  //                     child: Icon(
+  //                       getStatusIcon(),
+  //                       size: 80,
+  //                       color: getStatusColor(),
+  //                     ),
+  //                   );
+  //                 } else if (isHighTremor && hasNewAlert) {
+  //                   return Transform.scale(
+  //                     scale: _pulseAnimation.value,
+  //                     child: Icon(
+  //                       getStatusIcon(),
+  //                       size: 80,
+  //                       color: getStatusColor(),
+  //                     ),
+  //                   );
+  //                 } else {
+  //                   return Icon(
+  //                     getStatusIcon(),
+  //                     size: 80,
+  //                     color: getStatusColor(),
+  //                   );
+  //                 }
+  //               },
+  //             ),
+  //             SizedBox(height: 20),
+              
+  //             // Main Status Text
+  //             AnimatedDefaultTextStyle(
+  //               duration: Duration(milliseconds: 300),
+  //               style: TextStyle(
+  //                 fontSize: isHighTremor && hasNewAlert ? 28 : 26,
+  //                 fontWeight: FontWeight.bold,
+  //                 color: getStatusColor(),
+  //               ),
+  //               child: Text(
+  //                 getMainStatusText(),
+  //                 textAlign: TextAlign.center,
+  //               ),
+  //             ),
+              
+  //             SizedBox(height: 12),
+              
+  //             // Connection Status
+  //             Text(
+  //               connectionStatus,
+  //               style: TextStyle(
+  //                 fontSize: 16,
+  //                 color: Colors.grey.shade700,
+  //                 fontWeight: FontWeight.w500,
+  //               ),
+  //               textAlign: TextAlign.center,
+  //             ),
+              
+  //             // Alert Information
+  //             if (isHighTremor && alertTimestamp.isNotEmpty) ...[
+  //               SizedBox(height: 20),
+  //               Container(
+  //                 padding: EdgeInsets.all(16),
+  //                 decoration: BoxDecoration(
+  //                   gradient: LinearGradient(
+  //                     colors: hasNewAlert 
+  //                         ? [Colors.red.shade200, Colors.red.shade300]
+  //                         : [Colors.orange.shade100, Colors.orange.shade200], // Changed: lighter colors when acknowledged
+  //                   ),
+  //                   borderRadius: BorderRadius.circular(16),
+  //                   border: Border.all(
+  //                     color: hasNewAlert ? Colors.red.shade800 : Colors.orange.shade400, // Changed: orange when acknowledged
+  //                     width: hasNewAlert ? 2 : 1,
+  //                   ),
+  //                   boxShadow: [
+  //                     BoxShadow(
+  //                       color: (hasNewAlert ? Colors.red : Colors.orange).withOpacity(0.2), // Changed: orange shadow when acknowledged
+  //                       blurRadius: 8,
+  //                       offset: Offset(0, 4),
+  //                     ),
+  //                   ],
+  //                 ),
+  //                 child: Column(
+  //                   children: [
+  //                     if (hasNewAlert)
+  //                       Container(
+  //                         padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+  //                         decoration: BoxDecoration(
+  //                           color: Colors.red.shade800,
+  //                           borderRadius: BorderRadius.circular(20),
+  //                         ),
+  //                         child: Text(
+  //                           '🆕 NEW ALERT',
+  //                           style: TextStyle(
+  //                             fontSize: 14,
+  //                             color: Colors.white,
+  //                             fontWeight: FontWeight.bold,
+  //                           ),
+  //                         ),
+  //                       ),
+  //                     SizedBox(height: hasNewAlert ? 12 : 0),
+                      
+  //                     Row(
+  //                       children: [
+  //                         Icon(Icons.access_time, color: hasNewAlert ? Colors.red.shade700 : Colors.orange.shade700, size: 18), // Changed: orange when acknowledged
+  //                         SizedBox(width: 8),
+  //                         Expanded(
+  //                           child: Text(
+  //                             'Alert Time: $alertTimestamp',
+  //                             style: TextStyle(
+  //                               fontSize: 14,
+  //                               color: hasNewAlert ? Colors.red.shade800 : Colors.orange.shade800, // Changed: orange when acknowledged
+  //                               fontWeight: FontWeight.w600,
+  //                             ),
+  //                           ),
+  //                         ),
+  //                       ],
+  //                     ),
+                      
+  //                     if (alertTimeRemaining.isNotEmpty) ...[
+  //                       SizedBox(height: 8),
+  //                       Row(
+  //                         children: [
+  //                           Icon(Icons.timer, color: hasNewAlert ? Colors.red.shade700 : Colors.orange.shade700, size: 18), // Changed: orange when acknowledged
+  //                           SizedBox(width: 8),
+  //                           Expanded(
+  //                             child: Text(
+  //                               'Display Time: $alertTimeRemaining',
+  //                               style: TextStyle(
+  //                                 fontSize: 14,
+  //                                 color: hasNewAlert ? Colors.red.shade700 : Colors.orange.shade700, // Changed: orange when acknowledged
+  //                                 fontWeight: FontWeight.w500,
+  //                               ),
+  //                             ),
+  //                           ),
+  //                         ),
+  //                       ),
+  //                     ],
+                      
+  //                     if (currentAlertKey.isNotEmpty) ...[
+  //                       SizedBox(height: 8),
+  //                       Row(
+  //                         children: [
+  //                           Icon(Icons.fingerprint, color: hasNewAlert ? Colors.red.shade600 : Colors.orange.shade600, size: 16), // Changed: orange when acknowledged
+  //                           SizedBox(width: 8),
+  //                           Expanded(
+  //                             child: Text(
+  //                               'Alert ID: ${currentAlertKey.length > 20 ? currentAlertKey.substring(currentAlertKey.length - 20) : currentAlertKey}',
+  //                               style: TextStyle(
+  //                                 fontSize: 12,
+  //                                 color: hasNewAlert ? Colors.red.shade600 : Colors.orange.shade600, // Changed: orange when acknowledged
+  //                                 fontStyle: FontStyle.italic,
+  //                               ),
+  //                             ),
+  //                           ),
+  //                         ),
+  //                       ),
+  //                     ],
+  //                   ],
+  //                 ),
+  //               ),
+  //             ],
+  //           ],
+  //         ),
+  //       ),
+  //     ),
+  //   );
+  // }
+  Widget _buildMainStatusCard() {
+  return AnimatedContainer(
+    duration: Duration(milliseconds: 500),
+    child: Card(
+      elevation: isHighTremor && hasNewAlert ? 16 : 12,
+      shadowColor: isHighTremor && hasNewAlert ? Colors.red.withOpacity(0.5) : Colors.black26,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Container(
+        width: double.infinity,
+        padding: EdgeInsets.all(32.0),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(20),
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: !isFirebaseConnected 
+                ? [Colors.red.shade50, Colors.red.shade100]
+                : (isHighTremor && hasNewAlert)
+                    ? [Colors.red.shade50, Colors.red.shade100, Colors.red.shade50]
+                    : [Colors.green.shade50, Colors.green.shade100, Colors.green.shade50],
+          ),
+          border: isHighTremor && hasNewAlert
+              ? Border.all(color: Colors.red.shade800, width: 3)
+              : null,
+          boxShadow: isHighTremor && hasNewAlert ? [
+            BoxShadow(
+              color: Colors.red.withOpacity(0.3),
+              blurRadius: 15,
+              spreadRadius: 2,
+            )
+          ] : null,
+        ),
+        child: Column(
+          children: [
+            // Status Icon with animation
+            AnimatedBuilder(
+              animation: !isFirebaseConnected ? _rotationAnimation : _pulseAnimation,
+              builder: (context, child) {
+                if (!isFirebaseConnected) {
+                  return Transform.rotate(
+                    angle: _rotationAnimation.value * 2 * 3.14159,
+                    child: Icon(
+                      getStatusIcon(),
+                      size: 80,
+                      color: getStatusColor(),
+                    ),
+                  );
+                } else if (isHighTremor && hasNewAlert) {
+                  return Transform.scale(
+                    scale: _pulseAnimation.value,
+                    child: Icon(
+                      getStatusIcon(),
+                      size: 80,
+                      color: getStatusColor(),
+                    ),
+                  );
+                } else {
+                  return Icon(
+                    getStatusIcon(),
+                    size: 80,
+                    color: getStatusColor(),
+                  );
+                }
+              },
+            ),
+            SizedBox(height: 20),
+            
+            // Main Status Text
+            AnimatedDefaultTextStyle(
+              duration: Duration(milliseconds: 300),
+              style: TextStyle(
+                fontSize: isHighTremor && hasNewAlert ? 28 : 26,
+                fontWeight: FontWeight.bold,
+                color: getStatusColor(),
+              ),
+              child: Text(
+                getMainStatusText(),
+                textAlign: TextAlign.center,
+              ),
+            ),
+            
+            SizedBox(height: 12),
+            
+            // Connection Status
+            Text(
+              connectionStatus,
+              style: TextStyle(
+                fontSize: 16,
+                color: Colors.grey.shade700,
+                fontWeight: FontWeight.w500,
+              ),
+              textAlign: TextAlign.center,
+            ),
+            
+            // Alert Information
+            if (isHighTremor && alertTimestamp.isNotEmpty) ...[
+              SizedBox(height: 20),
+              Container(
+                padding: EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: hasNewAlert 
+                        ? [Colors.red.shade200, Colors.red.shade300]
+                        : [Colors.orange.shade100, Colors.orange.shade200], // Changed: lighter colors when acknowledged
+                  ),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: hasNewAlert ? Colors.red.shade800 : Colors.orange.shade400, // Changed: orange when acknowledged
+                    width: hasNewAlert ? 2 : 1,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: (hasNewAlert ? Colors.red : Colors.orange).withOpacity(0.2), // Changed: orange shadow when acknowledged
+                      blurRadius: 8,
+                      offset: Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  children: [
+                    if (hasNewAlert)
+                      Container(
+                        padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: Colors.red.shade800,
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text(
+                          '🆕 NEW ALERT',
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    SizedBox(height: hasNewAlert ? 12 : 0),
+                    
+                    Row(
+                      children: [
+                        Icon(Icons.access_time, color: hasNewAlert ? Colors.red.shade700 : Colors.orange.shade700, size: 18), // Changed: orange when acknowledged
+                        SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Alert Time: $alertTimestamp',
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: hasNewAlert ? Colors.red.shade800 : Colors.orange.shade800, // Changed: orange when acknowledged
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    
+                    if (alertTimeRemaining.isNotEmpty) ...[
+                      SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Icon(Icons.timer, color: hasNewAlert ? Colors.red.shade700 : Colors.orange.shade700, size: 18), // Changed: orange when acknowledged
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Display Time: $alertTimeRemaining',
+                              style: TextStyle(
+                                fontSize: 14,
+                                color: hasNewAlert ? Colors.red.shade700 : Colors.orange.shade700, // Changed: orange when acknowledged
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                    
+                    if (currentAlertKey.isNotEmpty) ...[
+                      SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Icon(Icons.fingerprint, color: hasNewAlert ? Colors.red.shade600 : Colors.orange.shade600, size: 16), // Changed: orange when acknowledged
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Alert ID: ${currentAlertKey.length > 20 ? currentAlertKey.substring(currentAlertKey.length - 20) : currentAlertKey}',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: hasNewAlert ? Colors.red.shade600 : Colors.orange.shade600, // Changed: orange when acknowledged
+                                fontStyle: FontStyle.italic,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    ),
+  );
+}
+  Widget _buildAlertDetailsCard() {
+    return Card(
+      elevation: 12,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(16),
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: hasNewAlert 
+                ? [Colors.red.shade50, Colors.red.shade100]
+                : [Colors.orange.shade50, Colors.orange.shade100], // Changed: orange when acknowledged
+          ),
+        ),
+        child: Padding(
+          padding: EdgeInsets.all(20.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Header with alert indicator
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        padding: EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: hasNewAlert ? Colors.red.shade100 : Colors.orange.shade100, // Changed: orange when acknowledged
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Icon(
+                          Icons.warning,
+                          color: hasNewAlert ? Colors.red.shade700 : Colors.orange.shade700, // Changed: orange when acknowledged
+                          size: 24,
+                        ),
+                      ),
+                      SizedBox(width: 12),
+                      Text(
+                        'High Tremor Alert Data',
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.grey.shade800,
+                        ),
+                      ),
+                    ],
+                  ),
+                  Container(
+                    padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: hasNewAlert 
+                            ? [Colors.red.shade200, Colors.red.shade300]
+                            : [Colors.orange.shade200, Colors.orange.shade300], // Changed: orange when acknowledged
+                      ),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Text(hasNewAlert ? 'ACTIVE' : 'VIEWED', // Changed: show status
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              SizedBox(height: 20),
+              
+              // Alert Tremor Analysis Data
+              _buildTremorDataGrid(
+                dominantFrequency: alertDominantFrequency,
+                tremorAmplitude: alertTremorAmplitude,
+                rhythmicity: alertRhythmicity,
+                harmonicRatio: alertHarmonicRatio,
+                tremorType: alertTremorType,
+                isHighTremor: true,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+  
+  Widget _buildRegularTremorDetailsCard() {
+    return Card(
+      elevation: 8,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(16),
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Colors.blue.shade50, Colors.blue.shade100],
+          ),
+        ),
+        child: Padding(
+          padding: EdgeInsets.all(20.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Header
+              Row(
+                children: [
+                  Container(
+                    padding: EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: Colors.blue.shade100,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Icon(
+                      Icons.analytics,
+                      color: Colors.blue.shade700,
+                      size: 24,
+                    ),
+                  ),
+                  SizedBox(width: 12),
+                  Text(
+                    'Regular Tremor Analysis',
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.grey.shade800,
+                    ),
+                  ),
+                ],
+              ),
+              SizedBox(height: 20),
+              
+              // Regular Tremor Analysis Data
+              _buildTremorDataGrid(
+                dominantFrequency: regularDominantFrequency,
+                tremorAmplitude: regularTremorAmplitude,
+                rhythmicity: regularRhythmicity,
+                harmonicRatio: regularHarmonicRatio,
+                tremorType: regularTremorType,
+                isHighTremor: false,
+              ),
+              
+              if (regularLastUpdateTime.isNotEmpty) ...[
+                SizedBox(height: 16),
+                Container(
+                  padding: EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.blue.shade200),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.update, color: Colors.blue.shade600, size: 16),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Last Update: $regularLastUpdateTime',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.blue.shade700,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+  
+  Widget _buildTremorDataGrid({
+    required double dominantFrequency,
+    required double tremorAmplitude,
+    required double rhythmicity,
+    required double harmonicRatio,
+    required String tremorType,
+    required bool isHighTremor,
+  }) {
+    Color primaryColor = isHighTremor 
+        ? (hasNewAlert ? Colors.red.shade700 : Colors.orange.shade700) // Changed: orange when acknowledged
+        : Colors.blue.shade700;
+    Color backgroundColor = isHighTremor 
+        ? (hasNewAlert ? Colors.red.shade50 : Colors.orange.shade50) // Changed: orange when acknowledged
+        : Colors.blue.shade50;
+    
+    return Column(
+      children: [
+        // First row
+        Row(
+          children: [
+            Expanded(
+              child: _buildDataItem(
+                'Frequency',
+                '${dominantFrequency.toStringAsFixed(1)} Hz',
+                Icons.waves,
+                primaryColor,
+                backgroundColor,
+              ),
+            ),
+            SizedBox(width: 12),
+            Expanded(
+              child: _buildDataItem(
+                'Amplitude',
+                tremorAmplitude.toStringAsFixed(3),
+                Icons.show_chart,
+                primaryColor,
+                backgroundColor,
+              ),
+            ),
+          ],
+        ),
+        SizedBox(height: 12),
+        // Second row
+        Row(
+          children: [
+            Expanded(
+              child: _buildDataItem(
+                'Rhythmicity',
+                '${(rhythmicity * 100).toStringAsFixed(1)}%',
+                Icons.graphic_eq,
+                primaryColor,
+                backgroundColor,
+              ),
+            ),
+            SizedBox(width: 12),
+            Expanded(
+              child: _buildDataItem(
+                'Harmonic Ratio',
+                harmonicRatio.toStringAsFixed(2),
+                Icons.multiline_chart,
+                primaryColor,
+                backgroundColor,
+              ),
+            ),
+          ],
+        ),
+        SizedBox(height: 12),
+        // Third row - Tremor Type (full width)
+        _buildDataItem(
+          'Tremor Type',
+          tremorType,
+          _getTremorTypeIcon(tremorType),
+          primaryColor,
+          backgroundColor,
+          isFullWidth: true,
+        ),
+      ],
+    );
+  }
+  
+  Widget _buildDataItem(String label, String value, IconData icon, Color color, Color backgroundColor, {bool isFullWidth = false}) {
+    return Container(
+      padding: EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: backgroundColor,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(icon, color: color, size: 20),
+          ),
+          SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Colors.grey.shade600,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                SizedBox(height: 4),
+                Text(
+                  value,
+                  style: TextStyle(
+                    fontSize: 16,
+                    color: color,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+  
+  IconData _getTremorTypeIcon(String type) {
+    switch (type) {
+      case 'REST':
+        return Icons.bed;
+      case 'POSTURAL':
+        return Icons.accessibility;
+      default:
+        return Icons.remove_circle_outline;
+    }
+  }
+  
+  Widget _buildSystemStatusCard() {
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: EdgeInsets.all(20.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.settings, color: Colors.grey.shade700, size: 24),
+                SizedBox(width: 12),
+                Text(
+                  'System Status',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.grey.shade800,
+                  ),
+                ),
+              ],
+            ),
+            SizedBox(height: 16),
+            
+            Row(
+              children: [
+                Expanded(
+                  child: _buildStatusItem(
+                    'Firebase',
+                    isFirebaseConnected ? 'Connected' : 'Disconnected',
+                    isFirebaseConnected ? Icons.cloud_done : Icons.cloud_off,
+                    isFirebaseConnected ? Colors.green : Colors.red,
+                  ),
+                ),
+                SizedBox(width: 12),
+                Expanded(
+                  child: _buildStatusItem(
+                    'Device ID',
+                    deviceId.replaceAll('ESP32_', ''),
+                    Icons.device_hub,
+                    Colors.blue,
+                  ),
+                ),
+              ],
+            ),
+            SizedBox(height: 12),
+            
+            Row(
+              children: [
+                Expanded(
+                  child: _buildStatusItem(
+                    'Alert Checks',
+                    '$alertCheckCount',
+                    Icons.search,
+                    Colors.orange,
+                  ),
+                ),
+                SizedBox(width: 12),
+                Expanded(
+                  child: _buildStatusItem(
+                    'Data Updates',
+                    '$dataUpdateCount',
+                    Icons.refresh,
+                    Colors.purple,
+                  ),
+                ),
+              ],
+            ),
+            
+            if (lastDataUpdateTime != null) ...[
+              SizedBox(height: 16),
+              Container(
+                padding: EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade100,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.access_time, color: Colors.grey.shade600, size: 16),
+                    SizedBox(width: 8),
+                    Text(
+                      'Last Data Update: ${lastDataUpdateTime!.toString().substring(11, 19)}',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.grey.shade700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+  
+  Widget _buildStatusItem(String label, String value, IconData icon, Color color) {
+    return Container(
+      padding: EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Column(
+        children: [
+          Icon(icon, color: color, size: 20),
+          SizedBox(height: 8),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 12,
+              color: Colors.grey.shade600,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          SizedBox(height: 4),
+          Text(
+            value,
+            style: TextStyle(
+              fontSize: 14,
+              color: color,
+              fontWeight: FontWeight.bold,
+            ),
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
+  
+  Widget _buildActionButtons() {
+    return Column(
+      children: [
+        // Acknowledge Alert Button - Only shown for new alerts
+        if (isHighTremor && hasNewAlert)
+          Container(
+            width: double.infinity,
+            margin: EdgeInsets.only(bottom: 12),
+            child: ElevatedButton.icon(
+              onPressed: () {
+                setState(() {
+                  hasNewAlert = false; // Mark alert as acknowledged
+                });
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('Alert acknowledged - monitoring continues'),
+                    backgroundColor: Colors.orange.shade600,
+                    behavior: SnackBarBehavior.floating,
+                  ),
+                );
+              },
+              icon: Icon(Icons.check_circle, color: Colors.white),
+              label: Text(
+                'ACKNOWLEDGE ALERT',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 16,
+                  color: Colors.white,
+                ),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.red.shade600,
+                padding: EdgeInsets.symmetric(vertical: 16),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                elevation: 8,
+              ),
+            ),
+          ),
+        
+        // Refresh Data Button
+        Container(
+          width: double.infinity,
+          margin: EdgeInsets.only(bottom: 12),
+          child: ElevatedButton.icon(
+            onPressed: isFirebaseConnected ? () async {
+              await Future.wait([
+                checkForAlerts(),
+                fetchRegularData(),
+              ]);
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Data refreshed successfully'),
+                  backgroundColor: Colors.green.shade600,
+                  behavior: SnackBarBehavior.floating,
+                ),
+              );
+            } : null,
+            icon: Icon(Icons.refresh, color: Colors.white),
+            label: Text(
+              'REFRESH DATA',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 16,
+                color: Colors.white,
+              ),
+            ),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: isFirebaseConnected ? Colors.blue.shade600 : Colors.grey,
+              padding: EdgeInsets.symmetric(vertical: 16),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              elevation: isFirebaseConnected ? 4 : 0,
+            ),
+          ),
+        ),
+        
+        // Reconnect Button - Only shown when disconnected
+        if (!isFirebaseConnected)
+          Container(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: () async {
+                setState(() {
+                  connectionStatus = "Reconnecting...";
+                });
+                await initializeFirebase();
+              },
+              icon: Icon(Icons.cloud_upload, color: Colors.white),
+              label: Text(
+                'RECONNECT TO FIREBASE',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 16,
+                  color: Colors.white,
+                ),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.orange.shade600,
+                padding: EdgeInsets.symmetric(vertical: 16),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                elevation: 4,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
